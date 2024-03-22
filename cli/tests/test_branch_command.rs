@@ -1348,6 +1348,80 @@ fn test_branch_list_tracked() {
     "###);
 }
 
+#[test]
+fn test_branch_list_conflicted() {
+    let test_env = TestEnvironment::default();
+    test_env.jj_cmd_ok(test_env.env_root(), &["init", "repo", "--git"]);
+    let repo_path = test_env.env_root().join("repo");
+
+    // Set up remote
+    let git_repo_path = test_env.env_root().join("git-repo");
+    let git_repo = git2::Repository::init(git_repo_path).unwrap();
+    test_env.jj_cmd_ok(
+        &repo_path,
+        &["git", "remote", "add", "origin", "../git-repo"],
+    );
+    let create_remote_commit = |message: &str, data: &[u8], ref_names: &[&str]| {
+        let signature =
+            git2::Signature::new("Some One", "some.one@example.com", &git2::Time::new(0, 0))
+                .unwrap();
+        let mut tree_builder = git_repo.treebuilder(None).unwrap();
+        let file_oid = git_repo.blob(data).unwrap();
+        tree_builder
+            .insert("file", file_oid, git2::FileMode::Blob.into())
+            .unwrap();
+        let tree_oid = tree_builder.write().unwrap();
+        let tree = git_repo.find_tree(tree_oid).unwrap();
+        // Create commit and branches in the remote
+        let git_commit_oid = git_repo
+            .commit(None, &signature, &signature, message, &tree, &[])
+            .unwrap();
+        for name in ref_names {
+            git_repo.reference(name, git_commit_oid, true, "").unwrap();
+        }
+    };
+
+    // Fetch new commit without auto tracking. No local branches should be
+    // created.
+    create_remote_commit(
+        "commit 1",
+        b"content 1",
+        &[
+            "refs/heads/main",
+            "refs/heads/feature1",
+            "refs/heads/feature2",
+        ],
+    );
+    test_env.add_config("git.auto-local-branch = false");
+    let (_stdout, stderr) = test_env.jj_cmd_ok(&repo_path, &["git", "fetch"]);
+
+    // Track new branch. Local branch should be created.
+    test_env.jj_cmd_ok(
+        &repo_path,
+        &["branch", "track", "feature1@origin", "main@origin"],
+    );
+
+    // Track existing branch. Local branch should result in conflict.
+    test_env.jj_cmd_ok(&repo_path, &["branch", "create", "feature2"]);
+    test_env.jj_cmd_ok(&repo_path, &["branch", "track", "feature2@origin"]);
+    insta::assert_snapshot!(get_branch_output(&test_env, &repo_path), @r###"
+    feature1: sptzoqmo 7b33f629 commit 1
+      @origin: sptzoqmo 7b33f629 commit 1
+    feature2 (conflicted):
+      + qpvuntsm 230dd059 (empty) (no description set)
+      + sptzoqmo 7b33f629 commit 1
+      @origin (behind by 1 commits): sptzoqmo 7b33f629 commit 1
+    main: sptzoqmo 7b33f629 commit 1
+      @origin: sptzoqmo 7b33f629 commit 1
+    "###);
+    insta::assert_snapshot!(get_conflicted_branch_output(&test_env, &repo_path), @r###"
+    feature2 (conflicted):
+      + qpvuntsm 230dd059 (empty) (no description set)
+      + sptzoqmo 7b33f629 commit 1
+      @origin (behind by 1 commits): sptzoqmo 7b33f629 commit 1
+    "###);
+}
+
 fn get_log_output(test_env: &TestEnvironment, cwd: &Path) -> String {
     let template = r#"branches ++ " " ++ commit_id.short()"#;
     test_env.jj_cmd_success(cwd, &["log", "-T", template])
@@ -1355,4 +1429,8 @@ fn get_log_output(test_env: &TestEnvironment, cwd: &Path) -> String {
 
 fn get_branch_output(test_env: &TestEnvironment, repo_path: &Path) -> String {
     test_env.jj_cmd_success(repo_path, &["branch", "list", "--all"])
+}
+
+fn get_conflicted_branch_output(test_env: &TestEnvironment, repo_path: &Path) -> String {
+    test_env.jj_cmd_success(repo_path, &["branch", "list", "--conflicted"])
 }
